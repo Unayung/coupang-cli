@@ -59,6 +59,12 @@ coupang search 衛生紙 [--limit 20] [--page 1] [--sort relevance|price|price-d
   `--page`/`--limit` are therefore a pure client-side window over this pool, not a
   literal pass-through of Coupang's own `page` query parameter.
 
+**Caveat (added 2026-10-30):** the human-mode (non `--json`) search table shows a short
+canonical URL (`https://www.tw.coupang.com/products/<id>`) instead of Coupang's actual
+product link, which carries ~400 chars of tracking params (`itemId`, `vendorItemId`,
+`sourceType`, `clickEventId`, ...) and used to flood the terminal. `--json` output is
+unchanged and still returns the full tracked URL.
+
 ### Product
 ```bash
 coupang product <id|url>        # (alias: item) title, brand, price, original price,

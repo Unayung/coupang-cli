@@ -15,6 +15,10 @@ description: Use when searching Coupang Taiwan (www.tw.coupang.com) products, ch
   items per request, so the CLI fetches extra remote pages as needed, dedupes by base
   product id, sorts client-side, then applies --page/--limit as a window over that pool
   (not a literal pass-through of Coupang's own page param).
+  CAVEAT (added 2026-10-30): human-mode (non --json) search table shows a short
+  https://www.tw.coupang.com/products/<id> URL instead of Coupang's ~400-char tracked
+  link (itemId/vendorItemId/sourceType/clickEventId...) to avoid flooding the terminal;
+  --json still returns the full tracked URL unchanged.
 - `coupang product <id|url> --json` (alias: `item`)
   returns title, brand, price, origin_price, discount, rating, reviews, in_stock, shipping (火箭速配), category, variants[] (selectable specs)
 - `coupang price <id> <id>... --json`

@@ -939,7 +939,11 @@ def cmd_search(args):
             rev_cnt = num(it.get("reviews"))
             rev = f"({int(rev_cnt):,})" if rev_cnt is not None else ""
             rk = "火箭速配" if it.get("rocket") else ""
-            rows.append([it["id"], t, p, op, disc, r, rev, rk, it["url"]])
+            # Human table shows a short canonical URL (full one is ~400 chars with
+            # tracking params - sourceType/itemId/vendorItemId/clickEventId/etc and
+            # floods the terminal). --json keeps the full tracked URL unchanged.
+            short_url = f"{ORIGIN}/products/{it['id']}" if it.get("id") else (it["url"] or "")
+            rows.append([it["id"], t, p, op, disc, r, rev, rk, short_url])
         hdrs = ["ID", "商品", "價格", "原價", "折扣", "評分", "評價", "運送", "URL"]
         return f"Coupang Search: '{q}' ({len(items)} results)\n" + table(rows, hdrs)
 

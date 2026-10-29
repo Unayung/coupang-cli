@@ -9,6 +9,12 @@ description: Use when searching Coupang Taiwan (www.tw.coupang.com) products, ch
 
 - `coupang search <keywords> --json [--sort price|relevance|sales|newest] [--limit N] [--min/--max TWD] [--page P]`
   returns items[] with id, item_id, vendor_item_id, title, price, origin_price, discount, rating, reviews, rocket, out_of_stock, url
+  CAVEAT (measured 2026-10-30): sponsored/ad slots (pinned regardless of sort/page) and
+  listings priced exactly NT$99,999 (a seller placeholder, confirmed on the product page)
+  are dropped. Coupang's own price/price-desc sort is only reliable for the first ~7-8
+  items per request, so the CLI fetches extra remote pages as needed, dedupes by base
+  product id, sorts client-side, then applies --page/--limit as a window over that pool
+  (not a literal pass-through of Coupang's own page param).
 - `coupang product <id|url> --json` (alias: `item`)
   returns title, brand, price, origin_price, discount, rating, reviews, in_stock, shipping (火箭速配), category, variants[] (selectable specs)
 - `coupang price <id> <id>... --json`

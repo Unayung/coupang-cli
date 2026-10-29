@@ -18,6 +18,28 @@ Search (Next.js RSC HTML, preprocessedProducts in self.__next_f.push):
               latestAsc (newest).
       Plain HTTPS works when valid session cookies + Edge UA are sent;
       when challenged by Akamai Bot Manager, auto-falls back to CDP background tab.
+      CAVEAT (measured 2026-10-30, confirmed on the live site's own sort control
+      and product pages in a background tab):
+        - Sponsored/ad slots (product link carries sourceType=srp_product_ads)
+          are pinned into the result list identically regardless of sort or
+          page - left in, they cause page N+1 to repeat page N's items and
+          break monotonic price order. The CLI drops every sponsored item.
+        - A small number of regular (non-ad) listings genuinely display the
+          literal price "$99,999" on their own product page - a seller-side
+          placeholder for a not-really-purchasable item. The CLI drops any
+          item priced exactly NT$99,999.
+        - Coupang's own salePriceAsc/salePriceDesc ordering is reliable for
+          roughly the first 7-8 items per request but drifts out of order
+          beyond that (confirmed on the live salePriceDesc page: positions
+          8-13 were NOT monotonic). So the CLI collects candidates across
+          as many remote search pages as needed (up to 6), dedupes by base
+          product id (the same product can list several price variants
+          under different itemId/vendorItemId - only the first-seen variant
+          is kept so a product never appears twice across pages), sorts
+          client-side for --sort price/price-desc, and paginates --page/
+          --limit from that clean pool. Very low prices (NT$1-$14) were
+          verified real on the product's own page (legitimate single-unit/
+          clearance variants), not misparsed per-unit prices - left in.
 
 Product page (HTML + JSON-LD + Option Table):
   GET https://www.tw.coupang.com/products/<id>?itemId=<itemId>&vendorItemId=<vendorItemId>
@@ -724,105 +746,183 @@ def cmd_doctor(args):
     return emit(ok(data), args.json, human)
 
 
+PLACEHOLDER_PRICE = 99999  # Coupang's own sentinel for unavailable/placeholder-priced listings
+
+
+def _search_extract_js():
+    return r"""
+    (() => {
+        const lis = Array.from(document.querySelectorAll("#product-list > li, li.ProductUnit_productUnit__Qd6sv"));
+        return lis.map(li => {
+            const a = li.querySelector("a[href*='/products/']");
+            const img = li.querySelector("img");
+            const text = li.innerText || "";
+            const href = a ? a.href : "";
+            const rawHref = a ? (a.getAttribute("href") || "") : "";
+            // Sponsored/ad slots carry sourceType=srp_product_ads in the raw link and are
+            // pinned regardless of sort/page - they must never be treated as real results.
+            const sponsored = rawHref.includes("sourceType=srp_product_ads") || rawHref.includes("clickEventId=");
+
+            // Title
+            let title = (img && img.alt && !img.alt.startsWith("$") && !img.alt.includes("回饋")) ? img.alt : "";
+            if (!title) {
+                const lines = text.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("$") && !l.includes("回饋") && !l.includes("折扣後") && l.length > 3);
+                title = lines[0] || "";
+            }
+
+            // Prices
+            const del = li.querySelector("del");
+            const origPrice = del ? Number(del.innerText.replace(/[$,]/g, "")) : null;
+            const priceEl = Array.from(li.querySelectorAll("*")).find(e => {
+                const t = e.innerText ? e.innerText.trim() : "";
+                return e.children.length === 0 && t && /^\$[\d,]+$/.test(t) && (!del || e !== del);
+            });
+            const price = priceEl ? Number(priceEl.innerText.replace(/[$,]/g, "")) : null;
+
+            // Discount rate
+            const discMatch = text.match(/(\d+)%/);
+            const discount = discMatch ? discMatch[1] + "%" : null;
+
+            // Reviews
+            const revMatch = text.match(/\(([\d,]+)\)/);
+            const reviews = revMatch ? Number(revMatch[1].replace(/,/g, "")) : null;
+
+            // ID
+            const m = href.match(/\/products\/(?:[^\s/?#]+-)?(\d+)/);
+            const id = m ? m[1] : "";
+
+            const m_item = href.match(/itemId=(\d+)/);
+            const m_viid = href.match(/vendorItemId=(\d+)/);
+
+            return {
+                id,
+                item_id: m_item ? m_item[1] : "",
+                vendor_item_id: m_viid ? m_viid[1] : "",
+                title,
+                price,
+                origin_price: origPrice && origPrice !== price ? origPrice : null,
+                discount,
+                rating: null,
+                reviews,
+                rocket: text.includes("火箭速配") || text.includes("酷澎直售") || text.includes("WOW免運"),
+                out_of_stock: text.includes("缺貨") || text.includes("售完"),
+                sponsored,
+                url: href
+            };
+        }).filter(it => it.id);
+    })()
+    """
+
+
+def _clean_search_items(raw_items):
+    """Drops sponsored/ad slots (pinned, ignore sort+page) and placeholder/null prices.
+
+    Returns (clean, dropped_ad_count, dropped_price_count) - clean items only, in
+    the order Coupang returned them, each item's own 'sponsored' flag removed.
+    """
+    clean = []
+    dropped_ad = dropped_price = 0
+    for it in raw_items:
+        if it.get("sponsored"):
+            dropped_ad += 1
+            continue
+        price = it.get("price")
+        if price is None or price <= 0 or price >= PLACEHOLDER_PRICE:
+            dropped_price += 1
+            continue
+        it = dict(it)
+        it.pop("sponsored", None)
+        clean.append(it)
+    return clean, dropped_ad, dropped_price
+
+
 def cmd_search(args):
     q = " ".join(args.query).strip()
     if not q:
         raise Usage("search query required: `coupang search <keywords>`")
-    params = {"q": q}
+    sort_key = None
     if args.sort:
-        s = SORTS.get(args.sort.lower())
-        if not s:
+        sort_key = SORTS.get(args.sort.lower())
+        if not sort_key:
             raise Usage(f"unknown sort '{args.sort}'. choices: {', '.join(sorted(set(SORTS)))}")
-        params["sorter"] = s
-    if args.page and args.page > 1:
-        params["page"] = str(args.page)
-    if args.min:
-        params["minPrice"] = str(int(args.min))
-    if args.max:
-        params["maxPrice"] = str(int(args.max))
+    is_price_sort = sort_key in ("salePriceAsc", "salePriceDesc")
 
-    url = f"{ORIGIN}/np/search?" + urllib.parse.urlencode(params)
+    limit = args.limit or 20
+    page = max(1, args.page or 1)
+    need = page * limit
+
+    def build_url(remote_page):
+        params = {"q": q}
+        if sort_key:
+            params["sorter"] = sort_key
+        if args.min:
+            params["minPrice"] = str(int(args.min))
+        if args.max:
+            params["maxPrice"] = str(int(args.max))
+        if remote_page > 1:
+            params["page"] = str(remote_page)
+        return f"{ORIGIN}/np/search?" + urllib.parse.urlencode(params)
+
     cl = Client(args)
-    items = []
+    collected = []
+    seen = set()
+    total_dropped_ad = total_dropped_price = 0
+    MAX_REMOTE_PAGES = 6
     try:
-        # Evaluate directly in background tab for full Next.js rendered catalog (36 items/page)
-        br = cl.browser(url=url)
-        # Wait for product list to render
-        t0 = time.time()
-        while time.time() - t0 < 8:
-            cnt = br.eval("document.querySelectorAll('#product-list > li').length") or 0
-            if cnt > 2:
+        br = cl.browser(url=build_url(1))
+        js_extract = _search_extract_js()
+        remote_page = 1
+        while True:
+            if remote_page > 1:
+                time.sleep(1.2)  # human-rate pacing between fetches
+                br.navigate(build_url(remote_page))
+            t0 = time.time()
+            while time.time() - t0 < 8:
+                cnt = br.eval("document.querySelectorAll('#product-list > li').length") or 0
+                if cnt > 2:
+                    break
+                time.sleep(0.5)
+
+            raw_items = br.eval(js_extract) or []
+            used_fallback = False
+            if not raw_items:
+                status, html = cl.request("GET", build_url(remote_page))
+                raw_items = parse_search_html(html)
+                used_fallback = True  # HTML fallback has no ad-detection field (undocumented upstream)
+
+            clean, dropped_ad, dropped_price = (
+                (raw_items, 0, 0) if used_fallback else _clean_search_items(raw_items)
+            )
+            if used_fallback:
+                clean = [it for it in clean if it.get("price") not in (None,) and 0 < it["price"] < PLACEHOLDER_PRICE]
+            total_dropped_ad += dropped_ad
+            total_dropped_price += dropped_price
+
+            new_count = 0
+            for it in clean:
+                # Dedupe on base product id alone: the same product can be listed
+                # multiple times with different itemId/vendorItemId (variant/pack
+                # options) at different prices - keep the first (cheapest for an
+                # asc sort, since collected gets re-sorted below) and drop repeats
+                # so the same product never shows up twice across pages.
+                key = it["id"]
+                if key in seen:
+                    continue
+                seen.add(key)
+                collected.append(it)
+                new_count += 1
+
+            if is_price_sort:
+                collected.sort(key=lambda x: x["price"], reverse=(sort_key == "salePriceDesc"))
+
+            if len(collected) >= need or new_count == 0 or remote_page >= MAX_REMOTE_PAGES:
                 break
-            time.sleep(0.5)
-
-        js_extract = r"""
-        (() => {
-            const lis = Array.from(document.querySelectorAll("#product-list > li, li.ProductUnit_productUnit__Qd6sv"));
-            return lis.map(li => {
-                const a = li.querySelector("a[href*='/products/']");
-                const img = li.querySelector("img");
-                const text = li.innerText || "";
-                const href = a ? a.href : "";
-                
-                // Title
-                let title = (img && img.alt && !img.alt.startsWith("$") && !img.alt.includes("回饋")) ? img.alt : "";
-                if (!title) {
-                    const lines = text.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("$") && !l.includes("回饋") && !l.includes("折扣後") && l.length > 3);
-                    title = lines[0] || "";
-                }
-                
-                // Prices
-                const del = li.querySelector("del");
-                const origPrice = del ? Number(del.innerText.replace(/[$,]/g, "")) : null;
-                const priceEl = Array.from(li.querySelectorAll("*")).find(e => {
-                    const t = e.innerText ? e.innerText.trim() : "";
-                    return e.children.length === 0 && t && /^\$[\d,]+$/.test(t) && (!del || e !== del);
-                });
-                const price = priceEl ? Number(priceEl.innerText.replace(/[$,]/g, "")) : null;
-                
-                // Discount rate
-                const discMatch = text.match(/(\d+)%/);
-                const discount = discMatch ? discMatch[1] + "%" : null;
-                
-                // Reviews
-                const revMatch = text.match(/\(([\d,]+)\)/);
-                const reviews = revMatch ? Number(revMatch[1].replace(/,/g, "")) : null;
-                
-                // ID
-                const m = href.match(/\/products\/(?:[^\s/?#]+-)?(\d+)/);
-                const id = m ? m[1] : "";
-                
-                const m_item = href.match(/itemId=(\d+)/);
-                const m_viid = href.match(/vendorItemId=(\d+)/);
-                
-                return {
-                    id,
-                    item_id: m_item ? m_item[1] : "",
-                    vendor_item_id: m_viid ? m_viid[1] : "",
-                    title,
-                    price,
-                    origin_price: origPrice && origPrice !== price ? origPrice : null,
-                    discount,
-                    rating: null,
-                    reviews,
-                    rocket: text.includes("火箭速配") || text.includes("酷澎直售") || text.includes("WOW免運"),
-                    out_of_stock: text.includes("缺貨") || text.includes("售完"),
-                    url: href
-                };
-            }).filter(it => it.id);
-        })()
-        """
-        items = br.eval(js_extract) or []
-
-        # If empty, fallback to HTML parsing
-        if not items:
-            status, html = cl.request("GET", url)
-            items = parse_search_html(html)
+            remote_page += 1
 
         if args.in_stock:
-            items = [it for it in items if not it["out_of_stock"]]
-        if args.limit:
-            items = items[:args.limit]
+            collected = [it for it in collected if not it["out_of_stock"]]
+
+        items = collected[(page - 1) * limit: page * limit]
     finally:
         cl.close()
 

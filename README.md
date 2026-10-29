@@ -48,6 +48,17 @@ coupang search 衛生紙 [--limit 20] [--page 1] [--sort relevance|price|price-d
                      [--min 100 --max 500] [--in-stock]
 ```
 
+**Caveat (measured 2026-10-30):** search results are cleaned before they reach you:
+- Sponsored/ad slots are dropped (they're pinned into the result list regardless of
+  sort/page and would otherwise repeat across pages and break price ordering).
+- Listings priced exactly `NT$99,999` are dropped (a seller-side placeholder for
+  listings that aren't really purchasable - confirmed on the product's own page).
+- Coupang's own `price`/`price-desc` sort is only reliable for ~7-8 items per
+  request, so the CLI fetches extra pages as needed, dedupes by base product id,
+  sorts client-side, and then applies `--page`/`--limit` to that clean pool.
+  `--page`/`--limit` are therefore a pure client-side window over this pool, not a
+  literal pass-through of Coupang's own `page` query parameter.
+
 ### Product
 ```bash
 coupang product <id|url>        # (alias: item) title, brand, price, original price,

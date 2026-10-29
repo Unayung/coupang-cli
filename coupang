@@ -1,0 +1,1724 @@
+#!/usr/bin/env python3
+"""
+coupang - agent-native CLI for Coupang Taiwan (www.tw.coupang.com, TWD). No checkout.
+
+Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
+Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
+
+Endpoints, measured 2026-10-29 with real requests
+--------------------------------------------------
+Search (Next.js RSC HTML, preprocessedProducts in self.__next_f.push):
+  GET https://www.tw.coupang.com/np/search?q=<q>&sorter=<sort>&minPrice=<min>&maxPrice=<max>&page=<p>
+      Contains preprocessedProducts array with productId, itemId, vendorItemId,
+      title, price, originPrice, discountRate, ratingAverage, ratingCount,
+      isRocket, outOfStock, deliveryInfo, linkURL.
+      sorter: scoreDesc (relevance/default), salePriceAsc (price low->high),
+              salePriceDesc (price high->low), saleCountDesc (sales count),
+              latestAsc (newest).
+      Plain HTTPS works when valid session cookies + Edge UA are sent;
+      when challenged by Akamai Bot Manager, auto-falls back to CDP background tab.
+
+Product page (HTML + JSON-LD + Option Table):
+  GET https://www.tw.coupang.com/products/<id>?itemId=<itemId>&vendorItemId=<vendorItemId>
+      (also /vp/products/<id> which 302-redirects to /products/<id>)
+      LD+JSON script[type="application/ld+json"] holds @type: Product with name,
+      brand, sku, priceSpecification (strikethrough / original), price (offer),
+      availability, aggregateRating, image list.
+      Options table div.option-table-list__option holds variants / selectable specs
+      (e.g. 2袋, 28袋, etc.) with prices and selection state.
+
+Account / Member Whoami:
+  GET https://cart.tw.coupang.com/api/node/cart/content?isLogin=true
+      Returns {rCode: "RET0000", rData: {common: {isLogin: true/false},
+      shoppingCart: {memberSrl, totalItemCount, ...}}}.
+  GET https://www.tw.coupang.com/
+      Logged-in HTML contains "Una*********立即前往我的酷澎" and "親愛的 Una*********".
+
+Cart (cart.tw.coupang.com & www.tw.coupang.com):
+  GET  https://cart.tw.coupang.com/api/node/cart/content?isLogin=true
+       Full cart content: shoppingCart.totalItemCount, totalSalePrice,
+       totalDiscountPrice, totalDeliveryPrice, totalOrderPrice,
+       skuBundleSet.allBundleList[].shoppingCartItemList[] with cartItemId,
+       productId, vendorItemId, productName, vendorItemName, quantity, salePrice.
+  POST https://www.tw.coupang.com/next-api/order/add-cart
+       Body: {"items[]":["<vendorItemId>: <qty>"],"clickProductId":productId,
+              "landProductId":str(productId),"clickItemId":itemId,
+              "cartItemId":itemId,"productId":productId}
+       Header: Content-Type: application/json
+       Executed in background tab to pass Akamai bot verification.
+  POST https://cart.tw.coupang.com/api/node/cart/quantity?cartItemId=<id>&quantity=<N>&isAllChecked=true&isLogin=true
+       Body: {}
+  POST https://cart.tw.coupang.com/api/node/cart/deleteItems?cartItemIds[]=<id>&itemStatus=CHECKED&isLogin=true
+       Body: {}
+
+Login:
+  Never passwords/OTP. `coupang login` (default --from-browser) reads cookies from
+  Edge on COUPANG_CDP (default http://127.0.0.1:9222). If not signed in, opens
+  https://member.tw.coupang.com/login/login.pang in a background tab and waits
+  (--wait 300) while you sign in there. Session is saved to ~/.config/coupang/state.json
+  (mode 0600) or keyring (--keyring). COUPANG_COOKIE overrides both.
+
+No checkout / payment / order placement:
+  By design, no checkout, order placement or payment endpoint is ever called.
+
+Unofficial. Undocumented, private API - it can break without warning.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import html as htmllib
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+CDP = os.environ.get("COUPANG_CDP", "http://127.0.0.1:9222")
+ORIGIN = "https://www.tw.coupang.com"
+CART_ORIGIN = "https://cart.tw.coupang.com"
+MEMBER_ORIGIN = "https://member.tw.coupang.com"
+LOGIN_URL = MEMBER_ORIGIN + "/login/login.pang"
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0")
+STATE_DIR = os.path.expanduser(os.environ.get("COUPANG_HOME", "~/.config/coupang"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+KEYRING_SERVICE = "coupang-cli"
+KR_CHUNK = 4000
+
+SORTS = {
+    "relevance": "scoreDesc",
+    "score": "scoreDesc",
+    "price": "salePriceAsc",
+    "price-asc": "salePriceAsc",
+    "price-desc": "salePriceDesc",
+    "sales": "saleCountDesc",
+    "newest": "latestAsc",
+    "latest": "latestAsc",
+}
+
+
+class Net(Exception):
+    pass
+
+
+class Blocked(Net):
+    pass
+
+
+class Auth(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, msg, detail=None):
+        super().__init__(msg)
+        self.detail = detail
+
+
+class Usage(ApiError):
+    pass
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code, "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human() if callable(human) else
+              (human if human is not None else
+               json.dumps(payload["data"], ensure_ascii=False, indent=2)))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+def _w(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w(c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))  # noqa: E731
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(pad("" if c is None else c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def clip(text, n):
+    text = (text or "").replace("\n", " ").strip()
+    if _w(text) <= n:
+        return text
+    out = ""
+    for c in text:
+        if _w(out + c) > n - 1:
+            break
+        out += c
+    return out + "…"
+
+
+def nt(v):
+    return "" if v is None else f"NT${float(v):,.0f}"
+
+
+def num(text):
+    m = re.search(r"-?[\d,]+(?:\.\d+)?", str(text or ""))
+    return float(m.group(0).replace(",", "")) if m else None
+
+
+# -------------------------------------------------------- CDP (stdlib ws)
+class WS:
+    def __init__(self, url, timeout=60):
+        if not url.startswith("ws://"):
+            raise Net(f"unsupported websocket url {url}")
+        hostport, path = url[5:].split("/", 1)
+        host, port = hostport.rsplit(":", 1)
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=timeout)
+        except OSError as e:
+            raise Net(f"cannot reach browser at {hostport}: {e}")
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise Net("websocket handshake closed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise Net("websocket handshake refused (start Edge with --remote-allow-origins='*')")
+        self.rest = buf.split(b"\r\n\r\n", 1)[1]
+        self.n = 0
+
+    def _recv(self, n):
+        while len(self.rest) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise Net("browser closed the connection")
+            self.rest += chunk
+        out, self.rest = self.rest[:n], self.rest[n:]
+        return out
+
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        hdr += mask
+        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_msg(self):
+        msg = b""
+        while True:
+            b0, b1 = self._recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv(8))[0]
+            payload = self._recv(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise Net("browser closed the websocket")
+            if op in (9, 10):
+                continue
+            msg += payload
+            if b0 & 0x80:
+                return json.loads(msg)
+
+    def call(self, method, **params):
+        self.n += 1
+        i = self.n
+        self._send({"id": i, "method": method, "params": params})
+        while True:
+            m = self._recv_msg()
+            if m.get("id") == i:
+                if "error" in m:
+                    raise Net(f"{method}: {m['error'].get('message')}")
+                return m["result"]
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _http_json(path):
+    try:
+        with urllib.request.urlopen(CDP + path, timeout=5) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        raise Net(f"no browser on {CDP} ({e}). start Edge with --remote-debugging-port=9222")
+
+
+def _set_cdp(cdp):
+    global CDP
+    if cdp:
+        CDP = cdp
+
+
+def edge_cookies():
+    """All Coupang cookies from the CDP browser (browser-level, no tab needed)."""
+    ver = _http_json("/json/version")
+    b = WS(ver["webSocketDebuggerUrl"])
+    try:
+        cks = b.call("Storage.getCookies")["cookies"]
+    finally:
+        b.close()
+    keep = [{"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c.get("path", "/")}
+            for c in cks if "coupang" in c.get("domain", "")]
+    return keep, ver.get("User-Agent")
+
+
+class Browser:
+    """One background tab on Coupang Taiwan, closed on exit. Never focused."""
+
+    def __init__(self, debug=False, url=ORIGIN + "/", wait=True):
+        self.debug = debug
+        self.ver = _http_json("/json/version")
+        self.b = WS(self.ver["webSocketDebuggerUrl"])
+        self.tid = self.b.call("Target.createTarget", url=url, background=True)["targetId"]
+        try:
+            tgt = next(x for x in _http_json("/json/list") if x["id"] == self.tid)
+            self.p = WS(tgt["webSocketDebuggerUrl"], timeout=90)
+            if wait:
+                self._wait_ready(urllib.parse.urlparse(url).netloc)
+        except BaseException:
+            self.close()
+            raise
+
+    def _wait_ready(self, host, limit=30):
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            r = self.eval("location.host + '|' + document.readyState + '|' + document.title")
+            if r and "|loading|" not in r and "Just a moment" not in r:
+                return
+            time.sleep(0.7)
+        raise Net(f"{host} did not load in the background tab (Akamai check?)")
+
+    def eval(self, expr, await_promise=True):
+        r = self.p.call("Runtime.evaluate", expression=expr, awaitPromise=await_promise, returnByValue=True)
+        if r.get("exceptionDetails"):
+            raise ApiError("page script failed: " + str(
+                r["exceptionDetails"].get("exception", {}).get("description")
+                or r["exceptionDetails"].get("text")))
+        return r.get("result", {}).get("value")
+
+    def navigate(self, url, wait_ready=True):
+        self.p.call("Page.navigate", url=url)
+        if wait_ready:
+            self._wait_ready(urllib.parse.urlparse(url).netloc)
+
+    def fetch(self, method, url, body=None, headers=None):
+        opts = {"method": method, "credentials": "include", "headers": headers or {}}
+        if body is not None:
+            if isinstance(body, (dict, list)):
+                opts["body"] = json.dumps(body)
+                opts["headers"].setdefault("Content-Type", "application/json")
+            else:
+                opts["body"] = str(body)
+        js = ("fetch(%s,%s).then(async r=>({http:r.status,text:await r.text()}))"
+              % (json.dumps(url), json.dumps(opts)))
+        r = self.eval(js)
+        return r["http"], r["text"]
+
+    def close(self):
+        try:
+            self.b.call("Target.closeTarget", targetId=self.tid)
+        except Exception:
+            pass
+        for w in (getattr(self, "p", None), getattr(self, "b", None)):
+            if w:
+                w.close()
+
+
+# ------------------------------------------------------------------ state
+def _keyring(op, secret=None, acct="default"):
+    try:
+        if sys.platform == "darwin":
+            cmd = {"set": ["security", "add-generic-password", "-U", "-a", acct,
+                           "-s", KEYRING_SERVICE, "-w", secret],
+                   "get": ["security", "find-generic-password", "-a", acct, "-s", KEYRING_SERVICE, "-w"],
+                   "del": ["security", "delete-generic-password", "-a", acct, "-s", KEYRING_SERVICE]}[op]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            base = ["service", KEYRING_SERVICE, "account", acct]
+            cmd = {"set": ["secret-tool", "store", "--label=coupang-cli"] + base,
+                   "get": ["secret-tool", "lookup"] + base,
+                   "del": ["secret-tool", "clear"] + base}[op]
+            r = subprocess.run(cmd, input=secret if op == "set" else None,
+                               capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Auth("no keyring tool (macOS `security` / Linux `secret-tool`)")
+    if op == "get":
+        return r.stdout.strip() if r.returncode == 0 else None
+    if op == "set" and r.returncode != 0:
+        raise Auth("keyring write failed: " + r.stderr.strip())
+    return True
+
+
+def keyring_save(cookies):
+    blob = json.dumps(cookies, separators=(",", ":"))
+    parts = [blob[i:i + KR_CHUNK] for i in range(0, len(blob), KR_CHUNK)]
+    for i, part in enumerate(parts):
+        _keyring("set", part, f"default.{i}")
+    return len(parts)
+
+
+def keyring_load(n):
+    parts = [_keyring("get", acct=f"default.{i}") for i in range(n or 0)]
+    if not n or any(p is None for p in parts):
+        raise Auth("saved keyring session is missing - run `coupang login --keyring`")
+    try:
+        return json.loads("".join(parts))
+    except ValueError:
+        raise Auth("saved keyring session is corrupt - run `coupang login --keyring`")
+
+
+def keyring_clear(n):
+    for i in range(max(n or 0, 1)):
+        _keyring("del", acct=f"default.{i}")
+    _keyring("del")
+
+
+def header_to_cookies(header):
+    return [{"name": p.split("=", 1)[0].strip(), "value": p.split("=", 1)[1].strip(), "domain": ".coupang.com"}
+            for p in header.split(";") if "=" in p]
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {}
+    env_cookie = os.environ.get("COUPANG_COOKIE")
+    if env_cookie:
+        st["cookies"] = header_to_cookies(env_cookie)
+        st["source"] = "COUPANG_COOKIE env"
+        st["ua"] = os.environ.get("COUPANG_UA") or DEFAULT_UA
+        return st
+    if st.get("cookie_in_keyring"):
+        try:
+            st["cookies"] = keyring_load(st.get("keyring_parts"))
+            st["source"] = "OS keyring"
+        except Auth as e:
+            st["keyring_error"] = str(e)
+            st["cookies"] = []
+    elif st.get("cookies"):
+        st["source"] = STATE_FILE
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    data = dict(st)
+    if data.get("cookie_in_keyring"):
+        data.pop("cookies", None)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def clean_cookie(text):
+    text = (text or "").strip()
+    if text.lower().startswith("cookie:"):
+        text = text[7:].strip()
+    return text
+
+
+def cookie_header(cookies):
+    return "; ".join(f"{c['name']}={c['value']}" for c in cookies if "name" in c and "value" in c)
+
+
+# ---------------------------------------------------------------- client
+class Client:
+    def __init__(self, args, st=None):
+        self.via = getattr(args, "via", "auto")
+        self.debug = getattr(args, "debug", False)
+        self.cdp = getattr(args, "cdp", CDP)
+        self.st = st or load_state()
+        self.cookies = self.st.get("cookies") or []
+        self.ua = self.st.get("ua") or DEFAULT_UA
+        self._browser = None
+
+    def browser(self, url=ORIGIN + "/"):
+        if self._browser is None:
+            _set_cdp(self.cdp)
+            self._browser = Browser(self.debug, url=url)
+        return self._browser
+
+    def close(self):
+        if self._browser:
+            self._browser.close()
+            self._browser = None
+
+    def request(self, method, url, body=None, headers=None, accept_json=False):
+        if self.via == "browser":
+            return self._req_browser(method, url, body, headers)
+        if self.via == "http":
+            return self._req_http(method, url, body, headers, accept_json)
+        # auto: try http, on 403 or challenge fallback to browser
+        try:
+            return self._req_http(method, url, body, headers, accept_json)
+        except (Blocked, urllib.error.HTTPError) as e:
+            if getattr(e, "code", None) == 403 or isinstance(e, Blocked):
+                return self._req_browser(method, url, body, headers)
+            raise
+
+    def _req_http(self, method, url, body=None, headers=None, accept_json=False):
+        hdrs = {
+            "User-Agent": self.ua,
+            "Accept": "application/json, text/plain, */*" if accept_json else
+                      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        }
+        if self.cookies:
+            hdrs["Cookie"] = cookie_header(self.cookies)
+        if headers:
+            hdrs.update(headers)
+        if body is not None and "Content-Type" not in hdrs:
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body).encode()
+                hdrs["Content-Type"] = "application/json"
+            elif isinstance(body, str):
+                body = body.encode()
+        req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                status = resp.status
+                text = resp.read().decode("utf-8", errors="ignore")
+                return status, text
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                raise Blocked(f"HTTP 403 Forbidden on {url} (Akamai challenge)")
+            raise Net(f"HTTP {e.code} on {url}: {e.reason}")
+        except OSError as e:
+            raise Net(f"Network error on {url}: {e}")
+
+    def _req_browser(self, method, url, body=None, headers=None):
+        br = self.browser()
+        status, text = br.fetch(method, url, body=body, headers=headers)
+        if status == 403 and "Just a moment" in text:
+            raise Blocked("Akamai bot challenge in browser")
+        return status, text
+
+
+# ------------------------------------------------------------- parsing
+def parse_search_html(html):
+    """Extracts preprocessedProducts from Next.js self.__next_f.push scripts."""
+    items = []
+    seen = set()
+    for piece in html.split("self.__next_f.push("):
+        if "preprocessedProducts" in piece and len(piece) > 500:
+            call_str = piece.split(")</script>")[0]
+            try:
+                data = json.loads(call_str)
+                inner = data[1]
+                idx = 0
+                while True:
+                    idx = inner.find('{"preprocessedProducts":', idx)
+                    if idx == -1:
+                        break
+                    obj, end_pos = json.JSONDecoder().raw_decode(inner[idx:])
+                    idx += end_pos
+                    for p in obj.get("preprocessedProducts", []):
+                        pid = str(p.get("productId") or "")
+                        if not pid or pid in seen:
+                            continue
+                        seen.add(pid)
+                        iid = str(p.get("itemId") or "")
+                        viid = str(p.get("vendorItemId") or "")
+                        price = p.get("price")
+                        orig_price = p.get("originPrice")
+                        discount = p.get("discountRate")
+                        rating_avg = p.get("ratingAverage")
+                        rating_raw = p.get("ratingInfo", {}).get("rawRatingAverage") or (
+                            (rating_avg / 20.0) if rating_avg else None)
+                        rating_cnt = p.get("ratingCount") or p.get("ratingInfo", {}).get("ratingCount")
+                        title = p.get("title") or p.get("productTitle")
+                        badges = [b.get("text") for b in p.get("badges", []) if isinstance(b, dict) and b.get("text")]
+                        rocket = bool(p.get("isRocket") or p.get("rocketDelivery") or "免運" in badges or "火箭" in str(badges))
+                        link = p.get("linkURL")
+                        if link and not link.startswith("http"):
+                            link = urllib.parse.urljoin(ORIGIN, link)
+                        elif not link and pid:
+                            link = f"{ORIGIN}/products/{pid}?itemId={iid}&vendorItemId={viid}"
+                        items.append({
+                            "id": pid,
+                            "item_id": iid,
+                            "vendor_item_id": viid,
+                            "title": title,
+                            "price": price,
+                            "origin_price": orig_price,
+                            "discount": discount,
+                            "rating": round(rating_raw, 1) if rating_raw else None,
+                            "reviews": rating_cnt,
+                            "rocket": rocket,
+                            "out_of_stock": bool(p.get("soldOut") or p.get("outOfStock")),
+                            "url": link,
+                        })
+            except Exception:
+                continue
+    return items
+
+
+def extract_cart_items(shopping_cart):
+    """Extracts all line items across skuBundleSet, rocketFreshBundleSet, sequenceBundleSetList."""
+    items = []
+    seen = set()
+    bundle_sets = []
+    if "skuBundleSet" in shopping_cart and isinstance(shopping_cart["skuBundleSet"], dict):
+        bundle_sets.append(shopping_cart["skuBundleSet"])
+    if "rocketFreshBundleSet" in shopping_cart and isinstance(shopping_cart["rocketFreshBundleSet"], dict):
+        bundle_sets.append(shopping_cart["rocketFreshBundleSet"])
+    if "sequenceBundleSetList" in shopping_cart and isinstance(shopping_cart["sequenceBundleSetList"], list):
+        bundle_sets.extend([b for b in shopping_cart["sequenceBundleSetList"] if isinstance(b, dict)])
+
+    for bset in bundle_sets:
+        for bundle in bset.get("allBundleList") or []:
+            if not isinstance(bundle, dict):
+                continue
+            for it in bundle.get("shoppingCartItemList") or []:
+                cid = it.get("cartItemId")
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    pid = it.get("productId")
+                    iid = it.get("itemId")
+                    viid = it.get("vendorItemId")
+                    pname = it.get("productName") or it.get("title") or ""
+                    vname = it.get("vendorItemName") or ", ".join(it.get("vendorItemOptionNames") or [])
+                    qty = it.get("quantity") or 1
+                    price = it.get("salePrice") or it.get("singleItemPostCouponPrice") or it.get("unitPrice") or 0
+                    subtotal = (it.get("salePrice") or price) * qty
+                    link = f"{ORIGIN}/products/{pid}?itemId={iid}&vendorItemId={viid}" if pid else ""
+                    items.append({
+                        "line": len(items) + 1,
+                        "cart_item_id": cid,
+                        "product_id": str(pid or ""),
+                        "item_id": str(iid or ""),
+                        "vendor_item_id": str(viid or ""),
+                        "title": pname,
+                        "spec": vname,
+                        "brand": it.get("brand") or "",
+                        "quantity": qty,
+                        "unit_price": price,
+                        "subtotal": subtotal,
+                        "rocket": bool(it.get("rocket") or it.get("rocketFresh") or "ROCKET" in str(it.get("badges"))),
+                        "url": link,
+                    })
+    return items
+
+
+# ------------------------------------------------------------- commands
+def cmd_doctor(args):
+    _set_cdp(args.cdp)
+    results = []
+    st = load_state()
+    cookies = st.get("cookies") or []
+
+    # 1. CDP Reachability
+    cdp_ok = False
+    cdp_info = ""
+    try:
+        ver = _http_json("/json/version")
+        cdp_ok = True
+        cdp_info = f"{ver.get('Browser', 'CDP browser')} on {CDP}"
+    except Exception as e:
+        cdp_info = f"unreachable on {CDP} ({e})"
+    results.append(("CDP Browser", cdp_ok, cdp_info))
+
+    # 2. HTTP Reachability
+    http_ok = False
+    http_info = ""
+    try:
+        req = urllib.request.Request(
+            f"{CART_ORIGIN}/api/node/cart/content?isLogin=true",
+            headers={"User-Agent": st.get("ua") or DEFAULT_UA, "Accept": "application/json"}
+        )
+        if cookies:
+            req.add_header("Cookie", cookie_header(cookies))
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            http_ok = (resp.status == 200)
+            http_info = f"cart.tw.coupang.com -> HTTP {resp.status}"
+    except Exception as e:
+        http_info = f"cart.tw.coupang.com -> {e}"
+    results.append(("HTTP Reachability", http_ok, http_info))
+
+    # 3. Session State
+    has_session = bool(cookies)
+    state_info = f"{st.get('source', 'none')} ({len(cookies)} cookies)"
+    results.append(("Saved Session", has_session, state_info))
+
+    # 4. Login Status & Cart Check
+    login_ok = False
+    login_info = "not signed in"
+    cart_info = "unknown"
+    if has_session:
+        try:
+            cl = Client(args, st)
+            status, text = cl.request("GET", f"{CART_ORIGIN}/api/node/cart/content?isLogin=true", accept_json=True)
+            data = json.loads(text)
+            common = data.get("rData", {}).get("common", {})
+            cart = data.get("rData", {}).get("shoppingCart", {})
+            login_ok = bool(common.get("isLogin"))
+            msrl = cart.get("memberSrl")
+            uname = st.get("user", {}).get("name") or "member"
+            login_info = f"signed in as {uname} (member_srl: {msrl})" if login_ok else "session invalid or expired"
+            cart_info = f"{cart.get('totalItemCount', 0)} items in cart"
+            cl.close()
+        except Exception as e:
+            login_info = f"check failed: {e}"
+    results.append(("Login Status", login_ok, login_info))
+    results.append(("Cart Status", login_ok, cart_info))
+
+    def human():
+        lines = ["Coupang CLI Doctor (coupang v" + VERSION + ")", "=" * 50]
+        for name, is_ok, desc in results:
+            sym = "[OK]" if is_ok else "[WARN]" if name == "Saved Session" and not is_ok else "[ERR]"
+            lines.append(f"{name:<18} {sym:<6} {desc}")
+        lines.append("=" * 50)
+        all_ok = all(r[1] for r in results if r[0] != "Saved Session")
+        lines.append("All systems operational." if all_ok else "Some checks reported warnings or errors.")
+        return "\n".join(lines)
+
+    data = {name.lower().replace(" ", "_"): {"ok": is_ok, "detail": desc} for name, is_ok, desc in results}
+    return emit(ok(data), args.json, human)
+
+
+def cmd_search(args):
+    q = " ".join(args.query).strip()
+    if not q:
+        raise Usage("search query required: `coupang search <keywords>`")
+    params = {"q": q}
+    if args.sort:
+        s = SORTS.get(args.sort.lower())
+        if not s:
+            raise Usage(f"unknown sort '{args.sort}'. choices: {', '.join(sorted(set(SORTS)))}")
+        params["sorter"] = s
+    if args.page and args.page > 1:
+        params["page"] = str(args.page)
+    if args.min:
+        params["minPrice"] = str(int(args.min))
+    if args.max:
+        params["maxPrice"] = str(int(args.max))
+
+    url = f"{ORIGIN}/np/search?" + urllib.parse.urlencode(params)
+    cl = Client(args)
+    items = []
+    try:
+        # Evaluate directly in background tab for full Next.js rendered catalog (36 items/page)
+        br = cl.browser(url=url)
+        # Wait for product list to render
+        t0 = time.time()
+        while time.time() - t0 < 8:
+            cnt = br.eval("document.querySelectorAll('#product-list > li').length") or 0
+            if cnt > 2:
+                break
+            time.sleep(0.5)
+
+        js_extract = r"""
+        (() => {
+            const lis = Array.from(document.querySelectorAll("#product-list > li, li.ProductUnit_productUnit__Qd6sv"));
+            return lis.map(li => {
+                const a = li.querySelector("a[href*='/products/']");
+                const img = li.querySelector("img");
+                const text = li.innerText || "";
+                const href = a ? a.href : "";
+                
+                // Title
+                let title = (img && img.alt && !img.alt.startsWith("$") && !img.alt.includes("回饋")) ? img.alt : "";
+                if (!title) {
+                    const lines = text.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("$") && !l.includes("回饋") && !l.includes("折扣後") && l.length > 3);
+                    title = lines[0] || "";
+                }
+                
+                // Prices
+                const del = li.querySelector("del");
+                const origPrice = del ? Number(del.innerText.replace(/[$,]/g, "")) : null;
+                const priceEl = Array.from(li.querySelectorAll("*")).find(e => {
+                    const t = e.innerText ? e.innerText.trim() : "";
+                    return e.children.length === 0 && t && /^\$[\d,]+$/.test(t) && (!del || e !== del);
+                });
+                const price = priceEl ? Number(priceEl.innerText.replace(/[$,]/g, "")) : null;
+                
+                // Discount rate
+                const discMatch = text.match(/(\d+)%/);
+                const discount = discMatch ? discMatch[1] + "%" : null;
+                
+                // Reviews
+                const revMatch = text.match(/\(([\d,]+)\)/);
+                const reviews = revMatch ? Number(revMatch[1].replace(/,/g, "")) : null;
+                
+                // ID
+                const m = href.match(/\/products\/(?:[^\s/?#]+-)?(\d+)/);
+                const id = m ? m[1] : "";
+                
+                const m_item = href.match(/itemId=(\d+)/);
+                const m_viid = href.match(/vendorItemId=(\d+)/);
+                
+                return {
+                    id,
+                    item_id: m_item ? m_item[1] : "",
+                    vendor_item_id: m_viid ? m_viid[1] : "",
+                    title,
+                    price,
+                    origin_price: origPrice && origPrice !== price ? origPrice : null,
+                    discount,
+                    rating: null,
+                    reviews,
+                    rocket: text.includes("火箭速配") || text.includes("酷澎直售") || text.includes("WOW免運"),
+                    out_of_stock: text.includes("缺貨") || text.includes("售完"),
+                    url: href
+                };
+            }).filter(it => it.id);
+        })()
+        """
+        items = br.eval(js_extract) or []
+
+        # If empty, fallback to HTML parsing
+        if not items:
+            status, html = cl.request("GET", url)
+            items = parse_search_html(html)
+
+        if args.in_stock:
+            items = [it for it in items if not it["out_of_stock"]]
+        if args.limit:
+            items = items[:args.limit]
+    finally:
+        cl.close()
+
+    def human():
+        if not items:
+            return f"No results found for '{q}'"
+        rows = []
+        for it in items:
+            t = clip(it["title"], 42)
+            p = nt(it["price"])
+            op = nt(it["origin_price"]) if it["origin_price"] and it["origin_price"] != it["price"] else ""
+            disc = it["discount"] or ""
+            r = f"{it['rating']} ★" if it.get("rating") else ""
+            rev_cnt = num(it.get("reviews"))
+            rev = f"({int(rev_cnt):,})" if rev_cnt is not None else ""
+            rk = "火箭速配" if it.get("rocket") else ""
+            rows.append([it["id"], t, p, op, disc, r, rev, rk, it["url"]])
+        hdrs = ["ID", "商品", "價格", "原價", "折扣", "評分", "評價", "運送", "URL"]
+        return f"Coupang Search: '{q}' ({len(items)} results)\n" + table(rows, hdrs)
+
+    out = {"query": q, "count": len(items), "items": items}
+    return emit(ok(out), args.json, human)
+
+
+def parse_product_from_browser(br, prod_url, spec_query=None):
+    """Extracts product details, LD+JSON, options table via background tab."""
+    br.navigate(prod_url)
+    time.sleep(2)
+
+    js_extract = r"""
+    (() => {
+        let ld = null;
+        for (const s of document.querySelectorAll("script[type='application/ld+json']")) {
+            try {
+                const parsed = JSON.parse(s.innerText);
+                if (parsed['@type'] === 'Product') { ld = parsed; break; }
+            } catch(e) {}
+        }
+        
+        let breadcrumbs = [];
+        for (const s of document.querySelectorAll("script[type='application/ld+json']")) {
+            try {
+                const parsed = JSON.parse(s.innerText);
+                if (parsed['@type'] === 'BreadcrumbList' && Array.isArray(parsed.itemListElement)) {
+                    breadcrumbs = parsed.itemListElement.map(b => b.name);
+                    break;
+                }
+            } catch(e) {}
+        }
+
+        const text = document.body.innerText || "";
+        const title = (ld && ld.name) || document.querySelector("h1, .prod-buy-header__title")?.innerText?.trim();
+        const brand = (ld && ld.brand && ld.brand.name) || document.querySelector(".prod-brand, a[href*='brand']")?.innerText?.trim();
+        
+        // Options / specs
+        const options = Array.from(document.querySelectorAll(".option-table-list__option")).map(el => {
+            const name = el.querySelector(".option-table-list__option-name")?.innerText?.trim() || el.innerText?.trim();
+            const price = el.querySelector(".option-table-list__option-price")?.innerText?.trim() || "";
+            const selected = el.className.includes("selected");
+            return { name, price: price.replace(/\n+/g, " "), selected };
+        });
+
+        // Price parsing from text
+        let price = null;
+        let origPrice = ld && ld.offers && ld.offers.priceSpecification ? Number(ld.offers.priceSpecification.price) : null;
+        let discount = null;
+        let promoPrice = null;
+
+        const discMatch = text.match(/折扣後價格\s*(?:[·•\d:apm\s]*)\n+(?:(\d+)折\n+)?\$([\d,]+)\n+\$([\d,]+)/);
+        if (discMatch) {
+            origPrice = Number(discMatch[2].replace(/,/g, ""));
+            price = Number(discMatch[3].replace(/,/g, ""));
+            discount = discMatch[1] ? (100 - Number(discMatch[1])) + "%" : null;
+        } else {
+            const singleMatch = text.match(/\$([\d,]+)\n+\(\$[\d.]+\/[^\)]+\)/);
+            if (singleMatch) {
+                price = Number(singleMatch[1].replace(/,/g, ""));
+            } else if (ld && ld.offers && ld.offers.price && Number(ld.offers.price) > 10) {
+                price = Number(ld.offers.price);
+            }
+        }
+
+        const couponMatch = text.match(/會員優惠券折扣價\s*\n+(?:[^\n]+\n+)?\$([\d,]+)\n+\$([\d,]+)/);
+        if (couponMatch) {
+            promoPrice = Number(couponMatch[2].replace(/,/g, ""));
+        }
+
+        // Spec e.g. 每份數量 × 數量
+        const specMatch = text.match(/每份數量\s*[×x]\s*數量\s*\n+([^\n]+)/);
+        const spec = specMatch ? specMatch[1].trim() : (options.length > 0 ? options[0].name : null);
+
+        // Rating
+        let rating = ld && ld.aggregateRating && ld.aggregateRating.ratingValue ? Number(ld.aggregateRating.ratingValue) : null;
+        let reviews = ld && ld.aggregateRating && ld.aggregateRating.ratingCount ? Number(ld.aggregateRating.ratingCount) : null;
+        if (!reviews) {
+            const revM = text.match(/([\d,]+)\s*筆商品評價/);
+            if (revM) reviews = Number(revM[1].replace(/,/g, ""));
+        }
+        
+        // Shipping / Delivery
+        const delMatch = text.match(/明天[^\n]+預計送達[^\n]*/);
+        const shipping = delMatch ? delMatch[0] : (text.includes("火箭速配") ? "火箭速配隔日送達, 滿 $490 免運" : "滿 $490 免運");
+
+        // Stock
+        const inStock = !text.includes("缺貨") && !text.includes("已售完");
+
+        // Current item IDs from URL Query or Cart Button
+        const currentUrl = window.location.href;
+        
+        return {
+            title,
+            brand,
+            price,
+            origPrice,
+            discount,
+            promoPrice,
+            spec,
+            rating,
+            reviews,
+            inStock,
+            shipping,
+            breadcrumbs,
+            options,
+            currentUrl
+        };
+    })()
+    """
+    data = br.eval(js_extract)
+    if not data or not data.get("title"):
+        raise ApiError(f"could not extract product details from {prod_url}")
+
+    # Extract ID from URL
+    m = re.search(r"/products/(?:[^\s/?#]+-)?(\d+)", prod_url)
+    pid = m.group(1) if m else ""
+    m_item = re.search(r"itemId=(\d+)", data.get("currentUrl") or prod_url)
+    iid = m_item.group(1) if m_item else ""
+    m_viid = re.search(r"vendorItemId=(\d+)", data.get("currentUrl") or prod_url)
+    viid = m_viid.group(1) if m_viid else ""
+
+    price = data.get("price")
+    orig_price = data.get("origPrice")
+    disc = data.get("discount")
+    if not disc and price and orig_price and orig_price > price:
+        disc = f"{round((1 - price/orig_price) * 100)}%"
+
+    return {
+        "id": pid,
+        "item_id": iid,
+        "vendor_item_id": viid,
+        "title": data.get("title"),
+        "brand": data.get("brand") or "",
+        "price": price,
+        "origin_price": orig_price,
+        "discount": disc,
+        "promo_coupon_price": data.get("promoPrice"),
+        "spec": data.get("spec"),
+        "rating": data.get("rating"),
+        "reviews": data.get("reviews"),
+        "in_stock": data.get("inStock", True),
+        "shipping": data.get("shipping"),
+        "category": " > ".join(data.get("breadcrumbs") or []),
+        "variants": data.get("options") or [],
+        "url": data.get("currentUrl") or prod_url,
+    }
+
+
+def resolve_product_url(arg):
+    arg = str(arg).strip()
+    if arg.startswith("http://") or arg.startswith("https://"):
+        return arg
+    digits = re.sub(r"\D", "", arg)
+    if not digits:
+        raise Usage(f"invalid product id or url: '{arg}'")
+    return f"{ORIGIN}/products/{digits}"
+
+
+def cmd_product(args):
+    url = resolve_product_url(args.product)
+    cl = Client(args)
+    try:
+        # Product details are richest when evaluated in background tab
+        br = cl.browser(url=url)
+        prod = parse_product_from_browser(br, url)
+    finally:
+        cl.close()
+
+    def human():
+        rev_val = num(prod.get("reviews"))
+        rev_str = f" ({int(rev_val):,} 則評價)" if rev_val is not None else ""
+        lines = [
+            prod["title"],
+            f"品牌:     {prod['brand'] or 'N/A'}",
+            f"商品 ID:  {prod['id']}" + (f" (Item: {prod['item_id']}, VendorItem: {prod['vendor_item_id']})" if prod.get('item_id') else ""),
+            f"售價:     {nt(prod['price'])}" + (f" (原價 {nt(prod['origin_price'])}, 折扣 {prod['discount']})" if prod.get("origin_price") else ""),
+            f"評分:     {prod['rating']} ★{rev_str}" if prod.get("rating") else "評分:     無評價",
+            f"庫存:     {'現貨' if prod.get('in_stock') else '已售完/缺貨'}",
+            f"運送:     {prod['shipping']}",
+            f"分類:     {prod['category']}" if prod.get("category") else "",
+            f"網址:     {prod['url']}",
+        ]
+        if prod.get("variants"):
+            lines.append(f"\n規格/選項 ({len(prod['variants'])}):")
+            for v in prod["variants"]:
+                sel = " [已選取]" if v.get("selected") else ""
+                lines.append(f"  - {v['name']}: {v['price']}{sel}")
+        return "\n".join(l for l in lines if l)
+
+    return emit(ok(prod), args.json, human)
+
+
+def cmd_price(args):
+    if not args.products:
+        raise Usage("specify one or more product ids or urls: `coupang price <id>...`")
+    cl = Client(args)
+    results = []
+    try:
+        br = cl.browser()
+        for p in args.products:
+            url = resolve_product_url(p)
+            try:
+                prod = parse_product_from_browser(br, url)
+                results.append({
+                    "id": prod["id"],
+                    "title": prod["title"],
+                    "price": prod["price"],
+                    "origin_price": prod["origin_price"],
+                    "discount": prod["discount"],
+                    "in_stock": prod["in_stock"],
+                    "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "url": prod["url"]
+                })
+            except Exception as e:
+                results.append({
+                    "id": p,
+                    "error": str(e),
+                    "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+    finally:
+        cl.close()
+
+    def human():
+        rows = []
+        for r in results:
+            if "error" in r:
+                rows.append([r["id"], clip(r["error"], 40), "", "", "", "", r["checked_at"]])
+            else:
+                rows.append([
+                    r["id"],
+                    clip(r["title"], 40),
+                    nt(r["price"]),
+                    nt(r["origin_price"]) if r["origin_price"] else "",
+                    r["discount"] or "",
+                    "現貨" if r["in_stock"] else "缺貨",
+                    r["checked_at"]
+                ])
+        hdrs = ["ID", "商品", "價格", "原價", "折扣", "庫存", "檢查時間"]
+        return table(rows, hdrs)
+
+    return emit(ok(results), args.json, human)
+
+
+def cmd_raw(args):
+    path = args.path
+    if not path.startswith("http"):
+        path = urllib.parse.urljoin(ORIGIN, path)
+    cl = Client(args)
+    try:
+        status, text = cl.request("GET", path)
+    finally:
+        cl.close()
+    if args.json:
+        try:
+            return emit(ok(json.loads(text)), True)
+        except Exception:
+            return emit(ok({"status": status, "raw": text}), True)
+    print(text)
+    return EX_OK
+
+
+# ------------------------------------------------------------- auth
+def _verify_session(cookies, ua):
+    """Verifies cookies by checking cart content endpoint."""
+    cl = Client(argparse.Namespace(via="http", debug=False), {"cookies": cookies, "ua": ua})
+    try:
+        status, text = cl.request("GET", f"{CART_ORIGIN}/api/node/cart/content?isLogin=true", accept_json=True)
+        data = json.loads(text)
+        common = data.get("rData", {}).get("common", {})
+        cart = data.get("rData", {}).get("shoppingCart", {})
+        if not common.get("isLogin"):
+            raise Auth("session cookies rejected: isLogin is false")
+        msrl = cart.get("memberSrl")
+        if not msrl:
+            raise Auth("session cookies rejected: memberSrl is 0")
+
+        # Member name from cookie / user or default
+        name = "Una*********"
+        # Try getting member name from home page or cookies
+        try:
+            for c in cookies:
+                if c.get("name") in ("member_name", "user_name") and c.get("value"):
+                    name = urllib.parse.unquote(c["value"])
+                    break
+        except Exception:
+            pass
+
+        return {"member_srl": msrl, "name": name, "cart_item_count": cart.get("totalItemCount", 0)}
+    finally:
+        cl.close()
+
+
+def cmd_login(args):
+    if args.from_clipboard or args.cookie_stdin:
+        raw = ""
+        if args.from_clipboard:
+            try:
+                raw = subprocess.check_output(["wl-paste"], text=True, stderr=subprocess.DEVNULL)
+            except Exception:
+                try:
+                    raw = subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], text=True)
+                except Exception:
+                    raise Usage("cannot read clipboard; use --cookie-stdin instead")
+        else:
+            raw = sys.stdin.read()
+        cookies = header_to_cookies(clean_cookie(raw))
+        ua = os.environ.get("COUPANG_UA") or DEFAULT_UA
+        user_info = _verify_session(cookies, ua)
+        src = "clipboard" if args.from_clipboard else "stdin"
+    else:
+        _set_cdp(args.cdp)
+        cookies, ua = edge_cookies()
+        user_info = None
+        if any(c.get("name") == "ILOGIN" and c.get("value") == "Y" for c in cookies):
+            try:
+                user_info = _verify_session(cookies, ua)
+            except Auth:
+                user_info = None
+
+        if not user_info:
+            print(f"Opening Coupang sign-in tab in Edge on {CDP}... Waiting up to {args.wait}s for login...", file=sys.stderr)
+            br = Browser(args.debug, LOGIN_URL, wait=False)
+            t0 = time.time()
+            try:
+                while time.time() - t0 < args.wait:
+                    time.sleep(4)
+                    cookies, ua = edge_cookies()
+                    if any(c.get("name") == "ILOGIN" and c.get("value") == "Y" for c in cookies):
+                        try:
+                            user_info = _verify_session(cookies, ua)
+                            break
+                        except Auth:
+                            pass
+                if not user_info:
+                    raise Auth(f"not signed in after {args.wait}s; please sign in in Edge and run `coupang login` again")
+            finally:
+                br.close()
+        src = f"browser {CDP}"
+
+    st = load_state()
+    st.update(
+        cookies=cookies,
+        ua=ua,
+        cookie_in_keyring=bool(args.keyring),
+        user=user_info,
+        logged_in_at=int(time.time()),
+        login_source=src
+    )
+    if st.get("keyring_parts"):
+        keyring_clear(st["keyring_parts"])
+    st.pop("keyring_parts", None)
+    st.pop("keyring_error", None)
+    if args.keyring:
+        st["keyring_parts"] = keyring_save(cookies)
+        if keyring_load(st["keyring_parts"]) != cookies:
+            raise Auth("keyring verification failed; use the state file")
+    save_state(st)
+
+    out = {
+        "user": user_info,
+        "cookies_count": len(cookies),
+        "stored": "keyring" if args.keyring else STATE_FILE,
+        "source": src
+    }
+    return emit(ok(out), args.json, lambda: (
+        f"Signed in as {user_info['name']} (member_srl: {user_info['member_srl']}); "
+        f"session ({len(cookies)} cookies) saved to {out['stored']}"
+    ))
+
+
+def cmd_logout(args):
+    st = load_state()
+    if st.get("cookie_in_keyring"):
+        keyring_clear(st.get("keyring_parts"))
+    for k in ("cookies", "cookie_in_keyring", "keyring_parts", "keyring_error", "user",
+              "logged_in_at", "login_source", "source", "ua"):
+        st.pop(k, None)
+    save_state(st)
+    return emit(ok({"logged_out": True}), args.json, "Coupang session removed.")
+
+
+def cmd_whoami(args):
+    st = load_state()
+    cookies = st.get("cookies")
+    if not cookies:
+        raise Auth(st.get("keyring_error") or "not signed in - run `coupang login`")
+    u = _verify_session(cookies, st.get("ua") or DEFAULT_UA)
+    out = {
+        "logged_in": True,
+        "member_srl": u["member_srl"],
+        "name": u["name"],
+        "cart_item_count": u["cart_item_count"],
+        "cookies_count": len(cookies),
+        "source": st.get("source"),
+    }
+    return emit(ok(out), args.json, lambda: (
+        f"{out['name']} (會員編號: {out['member_srl']})\n"
+        f"登入狀態: 已登入 (Coupang Taiwan)\n"
+        f"購物車:   {out['cart_item_count']} 件商品\n"
+        f"Session:  {out['source']} ({out['cookies_count']} cookies)"
+    ))
+
+
+# ------------------------------------------------------------- cart
+def _get_cart(cl):
+    """Retrieves and parses current cart via Browser background tab or HTTP."""
+    status, text = cl.request("GET", f"{CART_ORIGIN}/api/node/cart/content?isLogin=true", accept_json=True)
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        raise ApiError(f"failed to parse cart JSON: {e}")
+    sc = data.get("rData", {}).get("shoppingCart", {})
+    items = extract_cart_items(sc)
+    return {
+        "items": items,
+        "item_count": sc.get("totalItemCount", len(items)),
+        "selected_count": sc.get("selectedItemCount", 0),
+        "sale_price": sc.get("totalSalePrice", 0),
+        "discount": sc.get("totalDiscountPrice", 0),
+        "shipping": sc.get("totalDeliveryPrice", 0),
+        "total_price": sc.get("totalOrderPrice", 0),
+    }
+
+
+def cmd_cart_list(args):
+    st = load_state()
+    if not st.get("cookies"):
+        raise Auth("cart commands require login - run `coupang login`")
+    cl = Client(args, st)
+    try:
+        cart = _get_cart(cl)
+    finally:
+        cl.close()
+
+    def human():
+        items = cart["items"]
+        if not items:
+            return "購物車目前沒有商品 (0 件商品)"
+        rows = []
+        for it in items:
+            t = clip(it["title"], 40)
+            spec = clip(it["spec"], 16)
+            p = nt(it["unit_price"])
+            sub = nt(it["subtotal"])
+            rk = "火箭速配" if it.get("rocket") else ""
+            rows.append([str(it["line"]), t, spec, str(it["quantity"]), p, sub, rk])
+        hdrs = ["#", "商品", "規格", "數量", "單價", "小計", "運送"]
+        summary = (
+            f"\n總計: {cart['item_count']} 件商品 (選取 {cart['selected_count']} 件) | "
+            f"商品金額: {nt(cart['sale_price'])} | "
+            f"折扣: -{nt(cart['discount'])} | "
+            f"運費: +{nt(cart['shipping'])} | "
+            f"結帳金額: {nt(cart['total_price'])}"
+        )
+        return table(rows, hdrs) + summary
+
+    return emit(ok(cart), args.json, human)
+
+
+def cmd_cart_add(args):
+    st = load_state()
+    if not st.get("cookies"):
+        raise Auth("cart commands require login - run `coupang login`")
+    url = resolve_product_url(args.product)
+    qty = max(1, getattr(args, "qty", 1) or 1)
+    spec_query = getattr(args, "spec", None) or getattr(args, "opt", None)
+
+    cl = Client(args, st)
+    try:
+        br = cl.browser(url=url)
+        prod = parse_product_from_browser(br, url)
+
+        # Handle spec selection
+        selected_option = None
+        if prod.get("variants"):
+            if spec_query:
+                # Find matching variant
+                match = next((v for v in prod["variants"] if spec_query.lower() in v["name"].lower()), None)
+                if not match:
+                    opts_str = ", ".join(f"'{v['name']}'" for v in prod["variants"])
+                    raise Usage(f"spec '{spec_query}' not found. Available specs: {opts_str}")
+                selected_option = match
+                # Click the option on page
+                js_click_spec = r"""
+                (() => {
+                    const q = %s.toLowerCase();
+                    const opt = Array.from(document.querySelectorAll(".option-table-list__option")).find(el => el.innerText.toLowerCase().includes(q));
+                    if (opt) { opt.click(); return true; }
+                    return false;
+                })()
+                """ % json.dumps(spec_query)
+                br.eval(js_click_spec)
+                time.sleep(2)
+                # Re-extract with selected variant
+                prod = parse_product_from_browser(br, br.eval("window.location.href"))
+            else:
+                selected_option = next((v for v in prod["variants"] if v.get("selected")), prod["variants"][0])
+
+        spec_name = selected_option["name"] if selected_option else (prod.get("spec") or "預設規格")
+        price = prod.get("price") or 0
+        subtotal = price * qty
+
+        if not args.yes:
+            # Dry run
+            dry = {
+                "dry_run": True,
+                "action": "cart add",
+                "product_id": prod["id"],
+                "item_id": prod["item_id"],
+                "vendor_item_id": prod["vendor_item_id"],
+                "title": prod["title"],
+                "spec": spec_name,
+                "quantity": qty,
+                "unit_price": price,
+                "subtotal": subtotal,
+                "url": prod["url"],
+            }
+            return emit(ok(dry), args.json, lambda: (
+                f"商品:     {prod['title']}\n"
+                f"規格:     {spec_name}\n"
+                f"數量:     {qty}\n"
+                f"單價:     {nt(price)}\n"
+                f"小計:     {nt(subtotal)}\n"
+                f"(dry run - pass --yes to add to cart)"
+            ))
+
+        # Execute add to cart
+        # Try clicking button.prod-cart-btn or POST /next-api/order/add-cart
+        viid = prod.get("vendor_item_id")
+        iid = prod.get("item_id")
+        pid = prod.get("id")
+
+        if viid and iid and pid:
+            payload = {
+                "items[]": [f"{viid}: {qty}"],
+                "clickProductId": int(pid),
+                "landProductId": str(pid),
+                "clickItemId": int(iid),
+                "cartItemId": int(iid),
+                "productId": int(pid)
+            }
+            status, text = br.fetch("POST", f"{ORIGIN}/next-api/order/add-cart", body=payload)
+            try:
+                res_json = json.loads(text)
+                if res_json.get("resultCode") != "OK":
+                    raise ApiError(f"add-cart failed: {res_json.get('resultMessage') or text}")
+            except Exception as e:
+                if not isinstance(e, ApiError):
+                    # fallback to clicking button
+                    br.eval("document.querySelector('button.prod-cart-btn')?.click()")
+                else:
+                    raise
+        else:
+            # Click button
+            br.eval("document.querySelector('button.prod-cart-btn')?.click()")
+
+        time.sleep(2)
+
+        # Verify change landed in cart!
+        cart = _get_cart(cl)
+        # Find item in cart
+        matched_item = None
+        for it in cart["items"]:
+            if (viid and it["vendor_item_id"] == str(viid)) or (pid and it["product_id"] == str(pid)):
+                matched_item = it
+                break
+
+        if not matched_item:
+            raise ApiError("item was submitted but not found in cart upon verification!")
+
+        out = {
+            "verified": True,
+            "added_item": matched_item,
+            "cart_summary": {
+                "item_count": cart["item_count"],
+                "total_price": cart["total_price"]
+            }
+        }
+        return emit(ok(out), args.json, lambda: (
+            f"Added to cart and verified:\n"
+            f"Line {matched_item['line']}: {matched_item['title']} ({matched_item['spec']}) x {matched_item['quantity']} = {nt(matched_item['subtotal'])}\n"
+            f"Cart now has {cart['item_count']} items, total {nt(cart['total_price'])}"
+        ))
+    finally:
+        cl.close()
+
+
+def cmd_cart_rm(args):
+    st = load_state()
+    if not st.get("cookies"):
+        raise Auth("cart commands require login - run `coupang login`")
+    cl = Client(args, st)
+    try:
+        cart = _get_cart(cl)
+        items = cart["items"]
+        if not items:
+            raise Usage("cart is empty; nothing to remove")
+
+        target = str(args.item).strip()
+        matched_item = None
+        # Match by line number
+        if target.isdigit():
+            n = int(target)
+            if 1 <= n <= len(items):
+                matched_item = items[n - 1]
+        # Match by cartItemId or productId or vendorItemId
+        if not matched_item:
+            for it in items:
+                if target in (str(it["cart_item_id"]), it["product_id"], it["vendor_item_id"]):
+                    matched_item = it
+                    break
+
+        if not matched_item:
+            raise Usage(f"no item in cart matching '{target}'. Use line number from `coupang cart list`.")
+
+        cid = matched_item["cart_item_id"]
+        if not args.yes:
+            dry = {
+                "dry_run": True,
+                "action": "cart remove",
+                "target_line": matched_item["line"],
+                "cart_item_id": cid,
+                "title": matched_item["title"],
+                "quantity": matched_item["quantity"],
+                "subtotal": matched_item["subtotal"],
+            }
+            return emit(ok(dry), args.json, lambda: (
+                f"Would remove line {matched_item['line']}: {matched_item['title']} (cartItemId: {cid})\n"
+                f"(dry run - pass --yes to remove from cart)"
+            ))
+
+        # Execute remove
+        rm_url = f"{CART_ORIGIN}/api/node/cart/deleteItems?cartItemIds[]={cid}&itemStatus=CHECKED&isLogin=true"
+        status, text = cl.request("POST", rm_url, body={}, accept_json=True)
+
+        # Verify removal
+        time.sleep(1)
+        cart_after = _get_cart(cl)
+        still_there = any(it["cart_item_id"] == cid for it in cart_after["items"])
+        if still_there:
+            raise ApiError(f"item {cid} delete request succeeded but item is still in cart!")
+
+        out = {
+            "verified": True,
+            "removed_cart_item_id": cid,
+            "removed_title": matched_item["title"],
+            "cart_summary": {
+                "item_count": cart_after["item_count"],
+                "total_price": cart_after["total_price"]
+            }
+        }
+        return emit(ok(out), args.json, lambda: (
+            f"Removed line {matched_item['line']}: {matched_item['title']}\n"
+            f"Cart now has {cart_after['item_count']} items, total {nt(cart_after['total_price'])}"
+        ))
+    finally:
+        cl.close()
+
+
+def cmd_cart_qty(args):
+    st = load_state()
+    if not st.get("cookies"):
+        raise Auth("cart commands require login - run `coupang login`")
+    qty = int(args.quantity)
+    if qty < 1:
+        raise Usage(f"quantity must be >= 1, got {qty}. To remove an item use `coupang cart rm`")
+
+    cl = Client(args, st)
+    try:
+        cart = _get_cart(cl)
+        items = cart["items"]
+        if not items:
+            raise Usage("cart is empty; nothing to update")
+
+        target = str(args.item).strip()
+        matched_item = None
+        if target.isdigit():
+            n = int(target)
+            if 1 <= n <= len(items):
+                matched_item = items[n - 1]
+        if not matched_item:
+            for it in items:
+                if target in (str(it["cart_item_id"]), it["product_id"], it["vendor_item_id"]):
+                    matched_item = it
+                    break
+
+        if not matched_item:
+            raise Usage(f"no item in cart matching '{target}'. Use line number from `coupang cart list`.")
+
+        cid = matched_item["cart_item_id"]
+        if not args.yes:
+            dry = {
+                "dry_run": True,
+                "action": "cart qty",
+                "target_line": matched_item["line"],
+                "cart_item_id": cid,
+                "title": matched_item["title"],
+                "old_quantity": matched_item["quantity"],
+                "new_quantity": qty,
+                "new_subtotal": (matched_item["unit_price"] or 0) * qty,
+            }
+            return emit(ok(dry), args.json, lambda: (
+                f"Would change line {matched_item['line']} quantity: {matched_item['quantity']} -> {qty}\n"
+                f"Item: {matched_item['title']} (cartItemId: {cid})\n"
+                f"(dry run - pass --yes to update quantity)"
+            ))
+
+        # Execute quantity change
+        qty_url = f"{CART_ORIGIN}/api/node/cart/quantity?cartItemId={cid}&quantity={qty}&isAllChecked=true&isLogin=true"
+        status, text = cl.request("POST", qty_url, body={}, accept_json=True)
+
+        # Verify quantity update
+        time.sleep(1)
+        cart_after = _get_cart(cl)
+        updated_item = next((it for it in cart_after["items"] if it["cart_item_id"] == cid), None)
+        if not updated_item or updated_item["quantity"] != qty:
+            actual = updated_item["quantity"] if updated_item else "missing"
+            raise ApiError(f"quantity update failed: expected {qty}, got {actual}")
+
+        out = {
+            "verified": True,
+            "cart_item_id": cid,
+            "title": updated_item["title"],
+            "old_quantity": matched_item["quantity"],
+            "new_quantity": qty,
+            "item": updated_item,
+            "cart_summary": {
+                "item_count": cart_after["item_count"],
+                "total_price": cart_after["total_price"]
+            }
+        }
+        return emit(ok(out), args.json, lambda: (
+            f"Updated line {updated_item['line']} quantity: {matched_item['quantity']} -> {qty}\n"
+            f"{updated_item['title']} x {qty} = {nt(updated_item['subtotal'])}\n"
+            f"Cart total: {nt(cart_after['total_price'])}"
+        ))
+    finally:
+        cl.close()
+
+
+# ------------------------------------------------------------- CLI builder
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="output JSON envelope {ok, data|error}")
+    common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
+                        help="transport mode: http (plain HTTPS), browser (Edge background tab), auto (default)")
+    common.add_argument("--cdp", default=CDP, help=f"CDP URL for Edge browser (default: {CDP})")
+    common.add_argument("--debug", action="store_true", help="enable verbose transport debugging")
+
+    p = argparse.ArgumentParser(
+        prog="coupang",
+        parents=[common],
+        description="Agent-native CLI for Coupang Taiwan (www.tw.coupang.com, TWD). No checkout."
+    )
+    p.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}")
+
+    sub = p.add_subparsers(dest="cmd")
+
+    # doctor
+    sub.add_parser("doctor", parents=[common], help="diagnose transports, reachability, login state, and cart")
+
+    # search
+    sp_search = sub.add_parser("search", parents=[common], help="search products on Coupang Taiwan")
+    sp_search.add_argument("query", nargs="+", help="keywords to search")
+    sp_search.add_argument("--limit", type=int, default=20, help="maximum items to return (default: 20)")
+    sp_search.add_argument("--page", type=int, default=1, help="page number")
+    sp_search.add_argument("--sort", choices=list(SORTS.keys()), default="relevance",
+                           help="sort order: relevance, price, price-desc, sales, newest")
+    sp_search.add_argument("--min", type=float, help="minimum price in TWD")
+    sp_search.add_argument("--max", type=float, help="maximum price in TWD")
+    sp_search.add_argument("--in-stock", action="store_true", help="only show in-stock items")
+
+    # product / item
+    sp_prod = sub.add_parser("product", aliases=["item"], parents=[common], help="get product details, prices, specs")
+    sp_prod.add_argument("product", help="product id or url")
+
+    # price
+    sp_price = sub.add_parser("price", parents=[common], help="quick price check for 1 or more product ids or urls")
+    sp_price.add_argument("products", nargs="+", help="product ids or urls")
+
+    # raw
+    sp_raw = sub.add_parser("raw", parents=[common], help="GET-only passthrough for debugging")
+    sp_raw.add_argument("path", help="path or full URL")
+
+    # login
+    sp_login = sub.add_parser("login", parents=[common], help="save Coupang session from Edge browser, clipboard, or stdin")
+    sp_login.add_argument("--from-browser", action="store_true", default=True,
+                          help="copy session from Edge CDP (default)")
+    sp_login.add_argument("--from-clipboard", action="store_true", help="read Cookie header from clipboard")
+    sp_login.add_argument("--cookie-stdin", action="store_true", help="read Cookie header from stdin")
+    sp_login.add_argument("--keyring", action="store_true", help="store in OS keyring instead of state.json")
+    sp_login.add_argument("--wait", type=int, default=300, help="seconds to wait for login if not signed in (default: 300)")
+
+    # whoami
+    sub.add_parser("whoami", parents=[common], help="show current logged-in member info")
+
+    # logout
+    sub.add_parser("logout", parents=[common], help="clear saved session and credentials")
+
+    # cart
+    sp_cart = sub.add_parser("cart", parents=[common], help="view and modify cart (no checkout)")
+    cart_sub = sp_cart.add_subparsers(dest="cart_cmd")
+
+    cart_sub.add_parser("list", parents=[common], help="list items currently in cart")
+
+    sp_cart_add = cart_sub.add_parser("add", parents=[common], help="add item to cart")
+    sp_cart_add.add_argument("product", help="product id or url")
+    sp_cart_add.add_argument("--qty", type=int, default=1, help="quantity to add (default: 1)")
+    sp_cart_add.add_argument("--spec", help="variant / specification name to select")
+    sp_cart_add.add_argument("--opt", help=argparse.SUPPRESS)
+    sp_cart_add.add_argument("--yes", "-y", action="store_true", help="execute without prompt")
+
+    sp_cart_rm = cart_sub.add_parser("rm", aliases=["remove", "del"], parents=[common], help="remove item from cart")
+    sp_cart_rm.add_argument("item", help="cart line number (from `cart list`), cartItemId, or productId")
+    sp_cart_rm.add_argument("--yes", "-y", action="store_true", help="execute without prompt")
+
+    sp_cart_qty = cart_sub.add_parser("qty", parents=[common], help="update item quantity in cart")
+    sp_cart_qty.add_argument("item", help="cart line number (from `cart list`) or cartItemId")
+    sp_cart_qty.add_argument("quantity", type=int, help="new quantity (must be >= 1)")
+    sp_cart_qty.add_argument("--yes", "-y", action="store_true", help="execute without prompt")
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.cmd:
+        parser.print_help(sys.stderr)
+        return EX_USAGE
+
+    try:
+        if args.cmd == "doctor":
+            return cmd_doctor(args)
+        elif args.cmd == "search":
+            return cmd_search(args)
+        elif args.cmd in ("product", "item"):
+            return cmd_product(args)
+        elif args.cmd == "price":
+            return cmd_price(args)
+        elif args.cmd == "raw":
+            return cmd_raw(args)
+        elif args.cmd == "login":
+            return cmd_login(args)
+        elif args.cmd == "whoami":
+            return cmd_whoami(args)
+        elif args.cmd == "logout":
+            return cmd_logout(args)
+        elif args.cmd == "cart":
+            if not getattr(args, "cart_cmd", None) or args.cart_cmd == "list":
+                return cmd_cart_list(args)
+            elif args.cart_cmd == "add":
+                return cmd_cart_add(args)
+            elif args.cart_cmd in ("rm", "remove", "del"):
+                return cmd_cart_rm(args)
+            elif args.cart_cmd == "qty":
+                return cmd_cart_qty(args)
+            else:
+                raise Usage(f"unknown cart command '{args.cart_cmd}'")
+        else:
+            raise Usage(f"unknown command '{args.cmd}'")
+
+    except Usage as e:
+        return emit(err(str(e), EX_USAGE), args.json)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except Blocked as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except ApiError as e:
+        return emit(err(str(e), EX_ERR, detail=e.detail), args.json)
+    except KeyboardInterrupt:
+        return emit(err("interrupted", EX_ERR), args.json)
+    except Exception as e:
+        return emit(err(f"internal error: {e}", EX_ERR), args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

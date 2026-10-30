@@ -36,3 +36,5 @@ description: Use when searching Coupang Taiwan (www.tw.coupang.com) products, ch
   Always run first WITHOUT `--yes` to get the dry run, show it to the user, and pass `--yes` only after user confirmation.
   The CLI automatically re-reads the cart from the API and verifies that the change landed.
 - Safety: Never call checkout, payment, or order submission endpoints. The CLI has no checkout commands by design.
+
+CDP setup: if `coupang doctor` shows `cdp` failing and a command needs Edge, ask the user to start it as in README "Browser on CDP 9222" (separate `--user-data-dir`, `--remote-debugging-port=9222`). Never launch a browser yourself.

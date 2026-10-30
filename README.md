@@ -22,18 +22,31 @@ Tabs in Edge are never focused or disrupted. Background tabs are created with `T
 
 ## Login (no password, ever)
 
+Coupang signs in with a password (+ OTP), so the CLI never takes credentials. It logs in with the
+`Cookie` request header of a browser session you already have:
+
+1. In your browser: DevTools > Network > click any request to `www.tw.coupang.com` > Request Headers.
+2. Copy the value of `Cookie:` (with or without the leading `Cookie: `).
+3. Run `coupang login`. It reads the clipboard, or stdin when piped.
+
 ```bash
-coupang login                   # = --from-browser: copies active session from Edge on CDP;
-                                #   if not signed in, opens Coupang login in background and
-                                #   waits (--wait 300) while you sign in there
-coupang login --from-clipboard  # reads Cookie request header from clipboard
+coupang login                   # Cookie header from stdin (piped) or the clipboard;
+                                #   nothing usable there = exit 2 with these steps
+coupang login --from-clipboard  # clipboard only
 coupang login --cookie-stdin    # paste or pipe Cookie header via stdin
 coupang login --keyring         # store in OS keyring (secret-tool / macOS security)
+coupang login --from-browser    # opt-in: copy the session from Edge on CDP 9222; if not signed in,
+                                #   opens Coupang login in a background tab (--wait 300)
 coupang whoami
 coupang logout
 ```
 
-Session is saved to `~/.config/coupang/state.json` (mode 0600) or OS keyring. `COUPANG_COOKIE` environment variable overrides both. Sessions are verified against the real cart API before saving.
+Sessions are verified against the real cart API before saving to `~/.config/coupang/state.json`
+(mode 0600, `COUPANG_HOME` moves it) or the OS keyring. The `COUPANG_COOKIE` environment variable
+overrides both. Exit 3 means there is no valid session (or it expired): log in again.
+
+Edge on CDP 9222 is needed only for `login --from-browser`, `product`, `cart add`, and as the
+fallback when Akamai challenges a plain HTTPS read.
 
 ## Commands
 

@@ -75,8 +75,11 @@ Cart (cart.tw.coupang.com & www.tw.coupang.com):
        Body: {}
 
 Login:
-  Never passwords/OTP. `coupang login` (default --from-browser) reads cookies from
-  Edge on COUPANG_CDP (default http://127.0.0.1:9222). If not signed in, opens
+  Never passwords/OTP. `coupang login` takes a DevTools `Cookie:` request header: from
+  stdin when piped, else from the clipboard (exit 2 + instructions if the clipboard
+  holds no Coupang Cookie header). Also --from-clipboard / --cookie-stdin.
+  `coupang login --from-browser` (opt-in) reads cookies from Edge on COUPANG_CDP
+  (default http://127.0.0.1:9222). If not signed in, opens
   https://member.tw.coupang.com/login/login.pang in a background tab and waits
   (--wait 300) while you sign in there. Session is saved to ~/.config/coupang/state.json
   (mode 0600) or keyring (--keyring). COUPANG_COOKIE overrides both.
@@ -1249,10 +1252,36 @@ def _verify_session(cookies, ua):
         cl.close()
 
 
+LOGIN_HOWTO = ("no Coupang Cookie header found. In the browser: DevTools > Network > click any "
+               "request to www.tw.coupang.com > Request Headers > copy the `Cookie:` value, "
+               "then run `coupang login` again (or pipe it in)")
+
+
+def _default_cookie():
+    """No source flag: piped stdin, else the clipboard. Exit 2 with the howto if it is no cookie."""
+    raw = ""
+    if not sys.stdin.isatty():
+        raw = sys.stdin.read()
+    else:
+        for cmd in (["wl-paste", "-n"], ["pbpaste"], ["xclip", "-selection", "clipboard", "-o"]):
+            try:
+                raw = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=5)
+                break
+            except Exception:
+                continue
+    c = clean_cookie(raw)
+    if "\n" in c or "=" not in c or "ILOGIN=" not in c:
+        raise Usage(LOGIN_HOWTO)
+    return c
+
+
 def cmd_login(args):
-    if args.from_clipboard or args.cookie_stdin:
+    default = not (args.from_clipboard or args.cookie_stdin or args.from_browser)
+    if default or args.from_clipboard or args.cookie_stdin:
         raw = ""
-        if args.from_clipboard:
+        if default:
+            raw = _default_cookie()
+        elif args.from_clipboard:
             try:
                 raw = subprocess.check_output(["wl-paste"], text=True, stderr=subprocess.DEVNULL)
             except Exception:
@@ -1265,7 +1294,7 @@ def cmd_login(args):
         cookies = header_to_cookies(clean_cookie(raw))
         ua = os.environ.get("COUPANG_UA") or DEFAULT_UA
         user_info = _verify_session(cookies, ua)
-        src = "clipboard" if args.from_clipboard else "stdin"
+        src = "clipboard" if args.from_clipboard or (default and sys.stdin.isatty()) else "stdin"
     else:
         _set_cdp(args.cdp)
         cookies, ua = edge_cookies()
@@ -1742,9 +1771,9 @@ def build_parser():
     sp_raw.add_argument("path", help="path or full URL")
 
     # login
-    sp_login = sub.add_parser("login", parents=[common], help="save Coupang session from Edge browser, clipboard, or stdin")
-    sp_login.add_argument("--from-browser", action="store_true", default=True,
-                          help="copy session from Edge CDP (default)")
+    sp_login = sub.add_parser("login", parents=[common], help="save Coupang session (default: Cookie header from stdin or clipboard)")
+    sp_login.add_argument("--from-browser", action="store_true",
+                          help="copy session from Edge CDP (opt-in)")
     sp_login.add_argument("--from-clipboard", action="store_true", help="read Cookie header from clipboard")
     sp_login.add_argument("--cookie-stdin", action="store_true", help="read Cookie header from stdin")
     sp_login.add_argument("--keyring", action="store_true", help="store in OS keyring instead of state.json")

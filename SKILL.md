@@ -23,7 +23,10 @@ description: Use when searching Coupang Taiwan (www.tw.coupang.com) products, ch
   returns title, brand, price, origin_price, discount, rating, reviews, in_stock, shipping (火箭速配), category, variants[] (selectable specs)
 - `coupang price <id> <id>... --json`
   quick price check for 1 or more products for price monitoring (price, origin_price, discount, in_stock, checked_at)
-- Login: `coupang login` (default `--from-browser`) copies the active session from Edge on CDP 9222.
+- Login: never ask for or type passwords/OTP, and never ask the user to paste cookies into chat. Tell
+  the user: DevTools > Network > click any www.tw.coupang.com request > copy the `Cookie:` request header
+  to the clipboard, then run `coupang login` themselves (or pipe it in on stdin). No usable Cookie
+  header = exit 2 with those steps. `login --from-browser` is opt-in only (Edge on CDP 9222).
   `whoami` checks the saved session over the cart API (name, member_srl, cart items). Exit 3 = run `coupang login` again.
 - Cart (needs login):
   - `coupang cart list`
